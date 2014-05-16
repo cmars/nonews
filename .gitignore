@@ -1,0 +1,4 @@
+.*.swp
+cmd/nonews/nonews
+cmd/nonews/nonews.conf
+nonews.conf
