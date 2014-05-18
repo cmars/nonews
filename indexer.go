@@ -19,7 +19,6 @@ package nonews
 
 import (
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/cmars/nntp"
@@ -36,18 +35,24 @@ type Indexer struct {
 	Config *Config
 	Group  string
 
-	mutex   *sync.Mutex
-	conn    *nntp.Conn
 	session *mgo.Session
+
+	groupReq  chan *groupReq
+	groupResp chan *groupResp
+	headsReq  chan *headsReq
+	headsResp chan *headsResp
 }
 
 func NewIndexer(config *Config, group string) (*Indexer, error) {
 	var err error
-	indexer := &Indexer{Config: config, Group: group, mutex: &sync.Mutex{}}
+	indexer := &Indexer{
+		Config: config,
+		Group:  group,
 
-	indexer.conn, err = dialNntp(config)
-	if err != nil {
-		return nil, err
+		groupReq:  make(chan *groupReq),
+		groupResp: make(chan *groupResp),
+		headsReq:  make(chan *headsReq),
+		headsResp: make(chan *headsResp),
 	}
 
 	indexer.session, err = dialMongo(config)
@@ -103,9 +108,98 @@ func (idx *Indexer) ensureIndexes() error {
 }
 
 func (idx *Indexer) Start() {
+	go idx.nntpClient()
 	groupChan := idx.discoverArticles()
 	headerChan := idx.fetchArticles(groupChan)
 	idx.loadArticles(headerChan)
+}
+
+type groupReq struct {
+}
+
+type groupResp struct {
+	Group *nntp.Group
+	Error error
+}
+
+type headsReq struct {
+	Start, End int
+}
+
+type headsResp struct {
+	Articles []*nntp.Article
+	Last     int
+	Error    error
+}
+
+func (idx *Indexer) group(name string) (*nntp.Group, error) {
+	go func() {
+		idx.groupReq <- &groupReq{}
+	}()
+	resp := <-idx.groupResp
+	return resp.Group, resp.Error
+}
+
+func (idx *Indexer) articles(start, end int) ([]*nntp.Article, int, error) {
+	go func() {
+		idx.headsReq <- &headsReq{Start: start, End: end}
+	}()
+	resp := <-idx.headsResp
+	return resp.Articles, resp.Last, resp.Error
+}
+
+func (idx *Indexer) nntpClient() {
+	var conn *nntp.Conn
+	logger := loggo.GetLogger(idx.Group + ".client")
+	for {
+		var err error
+
+		if conn == nil {
+			conn, err = dialNntp(idx.Config)
+			if err != nil {
+				logger.Errorf("connect failed: %v", err)
+				time.Sleep(3 * time.Second)
+				continue
+			}
+		}
+
+		select {
+		case _ = <-idx.groupReq:
+			var group *nntp.Group
+			group, err = conn.Group(idx.Group)
+			idx.groupResp <- &groupResp{Group: group, Error: err}
+
+		case headsReq := <-idx.headsReq:
+			headsResp := &headsResp{}
+			_, err = conn.Group(idx.Group)
+			if err != nil {
+				headsResp.Error = err
+			}
+
+			for i := headsReq.Start; err == nil && i <= headsReq.End; i++ {
+				article, headErr := conn.Head(fmt.Sprintf("%d", i))
+				if errors.Check(headErr, nntp.IsProtocol) {
+					err = headErr
+					headsResp.Error = errors.Trace(headErr)
+				} else if nntp.ErrorCode(headErr) == 423 {
+					logger.Tracef("%v: %d", headErr, i)
+					continue
+				} else if headErr != nil {
+					headsResp.Error = errors.Annotatef(headsResp.Error, "HEAD %d: %v", i, headErr)
+				} else {
+					headsResp.Articles = append(headsResp.Articles, article)
+					headsResp.Last = i
+				}
+			}
+			idx.headsResp <- headsResp
+		}
+
+		if err != nil {
+			logger.Errorf("%s", errors.ErrorStack(err))
+			conn.Quit()
+			conn = nil
+		}
+	}
 }
 
 func (idx *Indexer) discoverArticles() chan *nntp.Group {
@@ -116,13 +210,11 @@ func (idx *Indexer) discoverArticles() chan *nntp.Group {
 		var group *nntp.Group
 		logger := loggo.GetLogger(idx.Group + ".discover")
 		for {
-			idx.mutex.Lock()
-			group, err = idx.conn.Group(idx.Group)
-			idx.mutex.Unlock()
+			group, err = idx.group(idx.Group)
 			if err != nil {
 				goto DELAY
 			}
-			logger.Tracef("%v", group)
+			logger.Debugf("%v", group)
 			groupChan <- group
 		DELAY:
 			if err != nil {
@@ -142,44 +234,39 @@ func (idx *Indexer) delay() {
 func (idx *Indexer) fetchArticles(groupChan chan *nntp.Group) chan *nntp.Article {
 	articleChan := make(chan *nntp.Article)
 
-	var last int
+	var start int
 	logger := loggo.GetLogger(idx.Group + ".headers")
 
 	go func() {
 		for group := range groupChan {
-			func() {
-				idx.mutex.Lock()
-				defer idx.mutex.Unlock()
-				defer logger.Debugf("done, last=%d", last)
+			var err error
 
-				var err error
+			if start == 0 {
+				start = group.High - 100
+			}
+			if group.High <= start {
+				logger.Debugf("no new articles")
+				return
+			}
 
-				if last == 0 {
-					last = group.High - 100
-				}
-				if group.High <= last {
-					logger.Debugf("no new articles")
-					return
-				}
+			logger.Debugf("fetching headers for %d-%d", start, group.High)
 
-				logger.Debugf("fetching headers for %d-%d", last, group.High)
+			articles, last, err := idx.articles(start, group.High)
+			if err != nil {
+				logger.Errorf("%v", err)
+				logger.Tracef(errors.ErrorStack(err))
+				continue
+			}
 
-				for i := last; i <= group.High; i++ {
-					article, headErr := idx.conn.Head(fmt.Sprintf("%d", i))
-					if headErr != nil {
-						if err == nil {
-							err = headErr
-						}
-						err = errors.Annotatef(headErr, "HEAD %d", i)
-						continue
-					}
-					articleChan <- article
-					last = i
-				}
-				if err != nil {
-					logger.Errorf(errors.ErrorStack(err))
-				}
-			}()
+			for _, article := range articles {
+				articleChan <- article
+			}
+
+			logger.Debugf("done, last=%d", last)
+
+			if last > 0 {
+				start = last + 1
+			}
 		}
 	}()
 
@@ -202,7 +289,7 @@ func (idx *Indexer) loadArticles(articles chan *nntp.Article) {
 
 			i++
 			if i%100 == 0 {
-				logger.Debugf("loaded %d headers", i)
+				logger.Debugf("loaded up to %d headers", i)
 			}
 		}
 	}()
