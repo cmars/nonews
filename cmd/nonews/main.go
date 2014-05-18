@@ -30,7 +30,7 @@ import (
 var configFile *string = flag.String("config", "", "Config file")
 var logLevelName *string = flag.String("loglevel", "WARNING", "Log level")
 
-var logger loggo.Logger = loggo.GetLogger("nonews")
+var logger loggo.Logger = loggo.GetLogger("nonews.main")
 
 func die(err error) {
 	logger.Errorf("%s", errors.ErrorStack(err))
@@ -59,7 +59,7 @@ func main() {
 		if err != nil {
 			die(err)
 		}
-		go indexer.Index()
+		indexer.Start()
 	}
 	fmt.Println("started")
 	<-chan struct{}(nil)

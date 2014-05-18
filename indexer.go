@@ -19,6 +19,7 @@ package nonews
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/cmars/nntp"
@@ -29,19 +30,20 @@ import (
 
 const DBNAME = "nonews"
 
-var logger loggo.Logger = loggo.GetLogger("nonews.indexer")
+var logger loggo.Logger = loggo.GetLogger("nonews")
 
 type Indexer struct {
 	Config *Config
 	Group  string
 
+	mutex   *sync.Mutex
 	conn    *nntp.Conn
 	session *mgo.Session
 }
 
 func NewIndexer(config *Config, group string) (*Indexer, error) {
 	var err error
-	indexer := &Indexer{Config: config, Group: group}
+	indexer := &Indexer{Config: config, Group: group, mutex: &sync.Mutex{}}
 
 	indexer.conn, err = dialNntp(config)
 	if err != nil {
@@ -92,61 +94,116 @@ func dialMongo(config *Config) (*mgo.Session, error) {
 }
 
 func (idx *Indexer) ensureIndexes() error {
-	// TODO: set up indexes on newsgroup collections
-	return nil
+	err := idx.session.DB(DBNAME).C(idx.Group).EnsureIndex(mgo.Index{
+		Key:      []string{"header.Message-Id"},
+		Unique:   true,
+		DropDups: true,
+	})
+	return err
 }
 
-func (idx *Indexer) Index() {
-	var from, to int
-	var loaded int
-	for {
-		logger.Infof("scanning %s", idx.Group)
-		_, low, high, err := idx.conn.Group(idx.Group)
-		if err != nil {
-			err = errors.Trace(err)
-			goto DELAY
-		}
-		logger.Debugf("group %s: low=%d, high=%d", idx.Group, low, high)
-		if high-low <= 0 {
-			logger.Warningf("empty group: %s", idx.Group)
-			goto DELAY
-		}
-		if from == 0 {
-			from = high - 100
-			to = high
-		} else {
-			from = to
-			to = high
-		}
-		if from-to == 0 {
-			logger.Debugf("no new news")
-			goto DELAY
-		}
+func (idx *Indexer) Start() {
+	groupChan := idx.discoverArticles()
+	headerChan := idx.fetchArticles(groupChan)
+	idx.loadArticles(headerChan)
+}
 
-		loaded = 0
-		for i := from; i <= to; i++ {
-			article, err := idx.conn.Head(fmt.Sprintf("%d", i))
+func (idx *Indexer) discoverArticles() chan *nntp.Group {
+	groupChan := make(chan *nntp.Group)
+
+	go func() {
+		var err error
+		var group *nntp.Group
+		logger := loggo.GetLogger(idx.Group + ".discover")
+		for {
+			idx.mutex.Lock()
+			group, err = idx.conn.Group(idx.Group)
+			idx.mutex.Unlock()
 			if err != nil {
-				err = errors.Trace(err)
 				goto DELAY
 			}
-			err = idx.session.DB(DBNAME).C(idx.Group).Insert(article)
+			logger.Tracef("%v", group)
+			groupChan <- group
+		DELAY:
 			if err != nil {
-				err = errors.Trace(err)
-				goto DELAY
+				logger.Errorf(errors.ErrorStack(err))
 			}
-			loaded++
+			idx.delay()
 		}
+	}()
+	return groupChan
+}
 
-	DELAY:
-		if loaded > 0 {
-			logger.Infof("group %s: loaded %d new headers", idx.Group, loaded)
+func (idx *Indexer) delay() {
+	delay := time.Duration(idx.Config.GroupDelay(idx.Group)) * time.Second
+	time.Sleep(delay)
+}
+
+func (idx *Indexer) fetchArticles(groupChan chan *nntp.Group) chan *nntp.Article {
+	articleChan := make(chan *nntp.Article)
+
+	var last int
+	logger := loggo.GetLogger(idx.Group + ".headers")
+
+	go func() {
+		for group := range groupChan {
+			func() {
+				idx.mutex.Lock()
+				defer idx.mutex.Unlock()
+				defer logger.Debugf("done, last=%d", last)
+
+				var err error
+
+				if last == 0 {
+					last = group.High - 100
+				}
+				if group.High <= last {
+					logger.Debugf("no new articles")
+					return
+				}
+
+				logger.Debugf("fetching headers for %d-%d", last, group.High)
+
+				for i := last; i <= group.High; i++ {
+					article, headErr := idx.conn.Head(fmt.Sprintf("%d", i))
+					if headErr != nil {
+						if err == nil {
+							err = headErr
+						}
+						err = errors.Annotatef(headErr, "HEAD %d", i)
+						continue
+					}
+					articleChan <- article
+					last = i
+				}
+				if err != nil {
+					logger.Errorf(errors.ErrorStack(err))
+				}
+			}()
 		}
-		if err != nil {
-			logger.Errorf("%s", errors.ErrorStack(err))
+	}()
+
+	return articleChan
+}
+
+func (idx *Indexer) loadArticles(articles chan *nntp.Article) {
+	logger := loggo.GetLogger(idx.Group + ".loader")
+	go func() {
+		i := 0
+		for article := range articles {
+			err := idx.session.DB(DBNAME).C(idx.Group).Insert(article)
+			if mgo.IsDup(err) {
+				logger.Tracef("already have %v", article)
+				continue
+			} else if err != nil {
+				err = errors.Annotatef(err, "%v", article)
+				logger.Errorf("insert failed: %v", errors.ErrorStack(err))
+			}
+
+			i++
+			if i%100 == 0 {
+				logger.Debugf("loaded %d headers", i)
+			}
 		}
-		delay := time.Duration(idx.Config.GroupDelay(idx.Group)) * time.Second
-		logger.Tracef("sleeping %v", delay)
-		time.Sleep(delay)
-	}
+	}()
 }
