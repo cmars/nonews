@@ -29,6 +29,7 @@ import (
 
 var configFile *string = flag.String("config", "", "Config file")
 var logLevelName *string = flag.String("loglevel", "WARNING", "Log level")
+var nconn *int = flag.Int("nconn", 3, "Number of news server connections")
 
 var logger loggo.Logger = loggo.GetLogger("nonews.main")
 
@@ -54,12 +55,15 @@ func main() {
 		die(err)
 	}
 
+	client := nonews.NewClient(config)
+	client.Start(*nconn)
+
 	for _, group := range config.IndexGroups() {
-		indexer, err := nonews.NewIndexer(config, group)
+		indexer, err := nonews.NewIndexer(group, config)
 		if err != nil {
 			die(err)
 		}
-		indexer.Start()
+		indexer.Start(client)
 	}
 	fmt.Println("started")
 	<-chan struct{}(nil)

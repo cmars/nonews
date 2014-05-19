@@ -90,7 +90,6 @@ const defaultGroupDelay = 300
 func (c *Config) GroupDelay(group string) int {
 	key := fmt.Sprintf("%s.delay", group)
 	v := c.Get(key)
-	logger.Tracef("key=%s v=%v", key, v)
 	if i, ok := v.(int64); ok {
 		return int(i)
 	}

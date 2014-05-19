@@ -18,7 +18,6 @@
 package nonews
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/cmars/nntp"
@@ -27,32 +26,23 @@ import (
 	"labix.org/v2/mgo"
 )
 
-const DBNAME = "nonews"
-
-var logger loggo.Logger = loggo.GetLogger("nonews")
+const (
+	DBNAME        = "nonews"
+	HeadChunkSize = 25
+)
 
 type Indexer struct {
 	Config *Config
 	Group  string
 
 	session *mgo.Session
-
-	groupReq  chan *groupReq
-	groupResp chan *groupResp
-	headsReq  chan *headsReq
-	headsResp chan *headsResp
 }
 
-func NewIndexer(config *Config, group string) (*Indexer, error) {
+func NewIndexer(group string, config *Config) (*Indexer, error) {
 	var err error
 	indexer := &Indexer{
 		Config: config,
 		Group:  group,
-
-		groupReq:  make(chan *groupReq),
-		groupResp: make(chan *groupResp),
-		headsReq:  make(chan *headsReq),
-		headsResp: make(chan *headsResp),
 	}
 
 	indexer.session, err = dialMongo(config)
@@ -65,29 +55,6 @@ func NewIndexer(config *Config, group string) (*Indexer, error) {
 		return nil, err
 	}
 	return indexer, nil
-}
-
-func dialNntp(config *Config) (*nntp.Conn, error) {
-	var conn *nntp.Conn
-	var err error
-
-	if config.TLS() {
-		conn, err = nntp.DialTLS("tcp", config.Addr(), nil)
-	} else {
-		conn, err = nntp.Dial("tcp", config.Addr())
-	}
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-
-	if config.Username() != "" {
-		err = conn.Authenticate(config.Username(), config.Password())
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-	}
-
-	return conn, nil
 }
 
 func dialMongo(config *Config) (*mgo.Session, error) {
@@ -107,102 +74,13 @@ func (idx *Indexer) ensureIndexes() error {
 	return err
 }
 
-func (idx *Indexer) Start() {
-	go idx.nntpClient()
-	groupChan := idx.discoverArticles()
-	headerChan := idx.fetchArticles(groupChan)
+func (idx *Indexer) Start(client *Client) {
+	groupChan := idx.discoverArticles(client)
+	headerChan := idx.fetchArticles(client, groupChan)
 	idx.loadArticles(headerChan)
 }
 
-type groupReq struct {
-}
-
-type groupResp struct {
-	Group *nntp.Group
-	Error error
-}
-
-type headsReq struct {
-	Start, End int
-}
-
-type headsResp struct {
-	Articles []*nntp.Article
-	Last     int
-	Error    error
-}
-
-func (idx *Indexer) group(name string) (*nntp.Group, error) {
-	go func() {
-		idx.groupReq <- &groupReq{}
-	}()
-	resp := <-idx.groupResp
-	return resp.Group, resp.Error
-}
-
-func (idx *Indexer) articles(start, end int) ([]*nntp.Article, int, error) {
-	go func() {
-		idx.headsReq <- &headsReq{Start: start, End: end}
-	}()
-	resp := <-idx.headsResp
-	return resp.Articles, resp.Last, resp.Error
-}
-
-func (idx *Indexer) nntpClient() {
-	var conn *nntp.Conn
-	logger := loggo.GetLogger(idx.Group + ".client")
-	for {
-		var err error
-
-		if conn == nil {
-			conn, err = dialNntp(idx.Config)
-			if err != nil {
-				logger.Errorf("connect failed: %v", err)
-				time.Sleep(3 * time.Second)
-				continue
-			}
-		}
-
-		select {
-		case _ = <-idx.groupReq:
-			var group *nntp.Group
-			group, err = conn.Group(idx.Group)
-			idx.groupResp <- &groupResp{Group: group, Error: err}
-
-		case headsReq := <-idx.headsReq:
-			headsResp := &headsResp{}
-			_, err = conn.Group(idx.Group)
-			if err != nil {
-				headsResp.Error = err
-			}
-
-			for i := headsReq.Start; err == nil && i <= headsReq.End; i++ {
-				article, headErr := conn.Head(fmt.Sprintf("%d", i))
-				if errors.Check(headErr, nntp.IsProtocol) {
-					err = headErr
-					headsResp.Error = errors.Trace(headErr)
-				} else if nntp.ErrorCode(headErr) == 423 {
-					logger.Tracef("%v: %d", headErr, i)
-					continue
-				} else if headErr != nil {
-					headsResp.Error = errors.Annotatef(headsResp.Error, "HEAD %d: %v", i, headErr)
-				} else {
-					headsResp.Articles = append(headsResp.Articles, article)
-					headsResp.Last = i
-				}
-			}
-			idx.headsResp <- headsResp
-		}
-
-		if err != nil {
-			logger.Errorf("%s", errors.ErrorStack(err))
-			conn.Quit()
-			conn = nil
-		}
-	}
-}
-
-func (idx *Indexer) discoverArticles() chan *nntp.Group {
+func (idx *Indexer) discoverArticles(client *Client) chan *nntp.Group {
 	groupChan := make(chan *nntp.Group)
 
 	go func() {
@@ -210,7 +88,7 @@ func (idx *Indexer) discoverArticles() chan *nntp.Group {
 		var group *nntp.Group
 		logger := loggo.GetLogger(idx.Group + ".discover")
 		for {
-			group, err = idx.group(idx.Group)
+			group, err = client.Group(idx.Group)
 			if err != nil {
 				goto DELAY
 			}
@@ -231,7 +109,7 @@ func (idx *Indexer) delay() {
 	time.Sleep(delay)
 }
 
-func (idx *Indexer) fetchArticles(groupChan chan *nntp.Group) chan *nntp.Article {
+func (idx *Indexer) fetchArticles(client *Client, groupChan chan *nntp.Group) chan *nntp.Article {
 	articleChan := make(chan *nntp.Article)
 
 	var start int
@@ -239,7 +117,6 @@ func (idx *Indexer) fetchArticles(groupChan chan *nntp.Group) chan *nntp.Article
 
 	go func() {
 		for group := range groupChan {
-			var err error
 
 			if start == 0 {
 				start = group.High - 100
@@ -249,24 +126,28 @@ func (idx *Indexer) fetchArticles(groupChan chan *nntp.Group) chan *nntp.Article
 				return
 			}
 
-			logger.Debugf("fetching headers for %d-%d", start, group.High)
-
-			articles, last, err := idx.articles(start, group.High)
-			if err != nil {
-				logger.Errorf("%v", err)
-				logger.Tracef(errors.ErrorStack(err))
-				continue
+			for i := start; i < group.High; i += HeadChunkSize {
+				from := i
+				var to int
+				if i+HeadChunkSize >= group.High {
+					to = group.High - 1
+				} else {
+					to = i + HeadChunkSize - 1
+				}
+				go func() {
+					logger.Debugf("fetching headers for %d-%d", from, to)
+					resp := client.Articles(idx.Group, from, to)
+					for articleHead := range resp {
+						if articleHead.Error != nil {
+							// TODO: retry failed articles
+						} else {
+							articleChan <- articleHead.Article
+						}
+					}
+				}()
 			}
 
-			for _, article := range articles {
-				articleChan <- article
-			}
-
-			logger.Debugf("done, last=%d", last)
-
-			if last > 0 {
-				start = last + 1
-			}
+			start = group.High
 		}
 	}()
 
