@@ -28,21 +28,27 @@ import (
 
 const (
 	DBNAME        = "nonews"
-	HeadChunkSize = 25
+	HeadChunkSize = 1024
 )
+
+var MeterFrequency = 10 * time.Second
 
 type Indexer struct {
 	Config *Config
 	Group  string
 
 	session *mgo.Session
+
+	headCounter chan int
+	headCount   int
 }
 
 func NewIndexer(group string, config *Config) (*Indexer, error) {
 	var err error
 	indexer := &Indexer{
-		Config: config,
-		Group:  group,
+		Config:      config,
+		Group:       group,
+		headCounter: make(chan int),
 	}
 
 	indexer.session, err = dialMongo(config)
@@ -75,9 +81,30 @@ func (idx *Indexer) ensureIndexes() error {
 }
 
 func (idx *Indexer) Start(client *Client) {
+	go idx.updateHeadCount()
 	groupChan := idx.discoverArticles(client)
 	headerChan := idx.fetchArticles(client, groupChan)
 	idx.loadArticles(headerChan)
+}
+
+func (idx *Indexer) updateHeadCount() {
+	lastCount := idx.headCount
+	ticker := time.NewTicker(MeterFrequency)
+	logger := loggo.GetLogger(idx.Group + ".headcount")
+	for {
+		select {
+		case delta, ok := <-idx.headCounter:
+			if !ok {
+				return
+			}
+			idx.headCount += delta
+		case _ = <-ticker.C:
+			if lastCount != idx.headCount {
+				logger.Infof("%s: %d article headers pending", idx.Group, idx.headCount)
+				lastCount = idx.headCount
+			}
+		}
+	}
 }
 
 func (idx *Indexer) discoverArticles(client *Client) chan *nntp.Group {
@@ -109,6 +136,10 @@ func (idx *Indexer) delay() {
 	time.Sleep(delay)
 }
 
+func (idx *Indexer) countHeads(delta int) {
+	idx.headCounter <- delta
+}
+
 func (idx *Indexer) fetchArticles(client *Client, groupChan chan *nntp.Group) chan *nntp.Article {
 	articleChan := make(chan *nntp.Article)
 
@@ -134,7 +165,9 @@ func (idx *Indexer) fetchArticles(client *Client, groupChan chan *nntp.Group) ch
 				} else {
 					to = i + HeadChunkSize - 1
 				}
+				idx.countHeads(to - from) // increment pending
 				go func() {
+					defer idx.countHeads(from - to) // decrement pending
 					logger.Debugf("fetching headers for %d-%d", from, to)
 					resp := client.Articles(idx.Group, from, to)
 					for articleHead := range resp {

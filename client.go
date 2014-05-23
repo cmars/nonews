@@ -87,14 +87,15 @@ type headsReq struct {
 	Start, End int
 }
 
-type ArticleHead struct {
-	Article *nntp.Article
-	Number  int
-	Error   error
+type Article struct {
+	*nntp.Article
+	Number   int
+	Error    error
+	ErrCount int
 }
 
 type headsResp struct {
-	Heads chan *ArticleHead
+	Heads chan *Article
 	Error error
 }
 
@@ -106,7 +107,7 @@ func (c *Client) Group(name string) (*nntp.Group, error) {
 	return resp.Group, resp.Error
 }
 
-func (c *Client) Articles(group string, start, end int) chan *ArticleHead {
+func (c *Client) Articles(group string, start, end int) chan *Article {
 	go func() {
 		c.headsReq <- &headsReq{Group: group, Start: start, End: end}
 	}()
@@ -136,7 +137,7 @@ func (c *Client) nntpClient() {
 			c.groupResp <- &groupResp{Group: group, Error: err}
 
 		case req := <-c.headsReq:
-			headsResp := &headsResp{Heads: make(chan *ArticleHead)}
+			headsResp := &headsResp{Heads: make(chan *Article)}
 			_, err = conn.Group(req.Group)
 			if err != nil {
 				headsResp.Error = err
@@ -148,7 +149,7 @@ func (c *Client) nntpClient() {
 				article, headErr := conn.Head(fmt.Sprintf("%d", i))
 				if errors.Check(headErr, nntp.IsProtocol) {
 					err = headErr
-					headsResp.Heads <- &ArticleHead{
+					headsResp.Heads <- &Article{
 						Number: i,
 						Error:  errors.Trace(headErr),
 					}
@@ -157,12 +158,12 @@ func (c *Client) nntpClient() {
 					logger.Tracef("%v: %d", headErr, i)
 					continue
 				} else if headErr != nil {
-					headsResp.Heads <- &ArticleHead{
+					headsResp.Heads <- &Article{
 						Number: i,
 						Error:  errors.Trace(headErr),
 					}
 				} else {
-					headsResp.Heads <- &ArticleHead{Article: article, Number: i}
+					headsResp.Heads <- &Article{Article: article, Number: i}
 				}
 			}
 			close(headsResp.Heads)
