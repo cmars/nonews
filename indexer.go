@@ -27,8 +27,9 @@ import (
 )
 
 const (
-	DBNAME        = "nonews"
-	HeadChunkSize = 1024
+	DbName             = "nonews"
+	ArticlesCollection = "articles"
+	HeadChunkSize      = 1024
 )
 
 var MeterFrequency = 10 * time.Second
@@ -71,13 +72,27 @@ func dialMongo(config *Config) (*mgo.Session, error) {
 	return session, nil
 }
 
-func (idx *Indexer) ensureIndexes() error {
-	err := idx.session.DB(DBNAME).C(idx.Group).EnsureIndex(mgo.Index{
-		Key:      []string{"header.Message-Id"},
+var mongoIndexes = []mgo.Index{
+	mgo.Index{
+		Key:      []string{"messageid"},
 		Unique:   true,
 		DropDups: true,
-	})
-	return err
+	},
+	mgo.Index{
+		Key: []string{"subject"},
+	},
+	mgo.Index{
+		Key: []string{"timestamp"},
+	},
+}
+
+func (idx *Indexer) ensureIndexes() error {
+	for _, index := range mongoIndexes {
+		if err := idx.session.DB(DbName).C(ArticlesCollection).EnsureIndex(index); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (idx *Indexer) Start(client *Client) {
@@ -111,19 +126,16 @@ func (idx *Indexer) discoverArticles(client *Client) chan *nntp.Group {
 	groupChan := make(chan *nntp.Group)
 
 	go func() {
-		var err error
-		var group *nntp.Group
 		logger := loggo.GetLogger(idx.Group + ".discover")
 		for {
-			group, err = client.Group(idx.Group)
-			if err != nil {
-				goto DELAY
-			}
-			logger.Debugf("%v", group)
-			groupChan <- group
-		DELAY:
-			if err != nil {
-				logger.Errorf(errors.ErrorStack(err))
+			for resp := range client.Group(idx.Group) {
+				if len(resp.Errors) > 0 {
+					for _, err := range resp.Errors {
+						logger.Errorf(errors.ErrorStack(err))
+					}
+				} else {
+					groupChan <- resp.Group
+				}
 			}
 			idx.delay()
 		}
@@ -140,8 +152,8 @@ func (idx *Indexer) countHeads(delta int) {
 	idx.headCounter <- delta
 }
 
-func (idx *Indexer) fetchArticles(client *Client, groupChan chan *nntp.Group) chan *nntp.Article {
-	articleChan := make(chan *nntp.Article)
+func (idx *Indexer) fetchArticles(client *Client, groupChan chan *nntp.Group) chan *Article {
+	articleChan := make(chan *Article)
 
 	var start int
 	logger := loggo.GetLogger(idx.Group + ".headers")
@@ -171,10 +183,10 @@ func (idx *Indexer) fetchArticles(client *Client, groupChan chan *nntp.Group) ch
 					logger.Debugf("fetching headers for %d-%d", from, to)
 					resp := client.Articles(idx.Group, from, to)
 					for articleHead := range resp {
-						if articleHead.Error != nil {
+						if len(articleHead.Errors) > 0 {
 							// TODO: retry failed articles
 						} else {
-							articleChan <- articleHead.Article
+							articleChan <- articleHead
 						}
 					}
 				}()
@@ -187,12 +199,12 @@ func (idx *Indexer) fetchArticles(client *Client, groupChan chan *nntp.Group) ch
 	return articleChan
 }
 
-func (idx *Indexer) loadArticles(articles chan *nntp.Article) {
+func (idx *Indexer) loadArticles(articles chan *Article) {
 	logger := loggo.GetLogger(idx.Group + ".loader")
 	go func() {
 		i := 0
 		for article := range articles {
-			err := idx.session.DB(DBNAME).C(idx.Group).Insert(article)
+			err := idx.session.DB(DbName).C(ArticlesCollection).Insert(article)
 			if mgo.IsDup(err) {
 				logger.Tracef("already have %v", article)
 				continue

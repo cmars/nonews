@@ -19,6 +19,8 @@ package nonews
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cmars/nntp"
@@ -26,21 +28,19 @@ import (
 	"github.com/juju/loggo"
 )
 
+var logger = loggo.GetLogger("nonews")
+
 type Client struct {
-	config    *Config
-	groupReq  chan *groupReq
-	groupResp chan *groupResp
-	headsReq  chan *headsReq
-	headsResp chan *headsResp
+	config   *Config
+	groupReq chan *groupReq
+	headsReq chan *headsReq
 }
 
 func NewClient(config *Config) *Client {
 	return &Client{
-		config:    config,
-		groupReq:  make(chan *groupReq),
-		groupResp: make(chan *groupResp),
-		headsReq:  make(chan *headsReq),
-		headsResp: make(chan *headsResp),
+		config:   config,
+		groupReq: make(chan *groupReq),
+		headsReq: make(chan *headsReq),
 	}
 }
 
@@ -75,44 +75,164 @@ func (c *Client) Start(n int) {
 
 type groupReq struct {
 	Name string
-}
-
-type groupResp struct {
-	Group *nntp.Group
-	Error error
+	Resp chan *Group
 }
 
 type headsReq struct {
 	Group      string
 	Start, End int
+	Resp       chan *Article
+}
+
+type PartType string
+
+const (
+	NfoPart  = PartType("nfo")
+	SfvPart  = PartType("sfv")
+	RarPart  = PartType("rar")
+	Par2Part = PartType("par2")
+)
+
+type Part struct {
+	Collection string
+	Num        int
+	Total      int
+	Type       PartType
+}
+
+type Xref struct {
+	Server string `bson:",omitempty"`
+	Group  string
+	Number int
+}
+
+type Group struct {
+	*nntp.Group
+
+	Errors []error
 }
 
 type Article struct {
-	*nntp.Article
-	Number   int
-	Error    error
-	ErrCount int
+	Header map[string][]string
+
+	MessageId string
+	Subject   string
+	Xref      []Xref
+	Timestamp int64
+
+	Part Part
+
+	Errors []error `bson:",omitempty"`
 }
 
-type headsResp struct {
-	Heads chan *Article
-	Error error
+var ErrMalformedXref = fmt.Errorf("malformed xref")
+
+func ParseXref(xref string) ([]Xref, error) {
+	var result []Xref
+	wsplit := strings.SplitN(xref, " ", 2)
+	if len(wsplit) < 2 {
+		return nil, ErrMalformedXref
+	}
+	server := wsplit[0]
+	wsplit = strings.Split(wsplit[1], " ")
+	for _, part := range wsplit {
+		colsplit := strings.Split(part, ":")
+		if len(colsplit) < 2 {
+			return nil, ErrMalformedXref
+		}
+		num, err := strconv.Atoi(colsplit[1])
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, Xref{
+			Server: server,
+			Group:  colsplit[0],
+			Number: num,
+		})
+	}
+	return result, nil
 }
 
-func (c *Client) Group(name string) (*nntp.Group, error) {
-	go func() {
-		c.groupReq <- &groupReq{Name: name}
-	}()
-	resp := <-c.groupResp
-	return resp.Group, resp.Error
+var postingDateFormats = []string{
+	"Mon, 2 Jan 2006 15:04:05 -0700",
+	"Mon, 2 Jan 2006 15:04:05 MST",
+}
+
+func ParsePostingDate(s string) (time.Time, error) {
+	var err error
+	for _, format := range postingDateFormats {
+		t, err := time.Parse(format, s)
+		if err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, err
+}
+
+func NewArticle(a *nntp.Article) *Article {
+	article := &Article{Header: a.Header}
+	if messageId, ok := a.Header["Message-Id"]; ok && len(messageId) > 0 {
+		article.MessageId = a.Header["Message-Id"][0]
+	} else {
+		article.Errors = append(article.Errors, fmt.Errorf("missing Message-Id"))
+	}
+
+	if subject, ok := a.Header["Subject"]; ok && len(subject) > 0 {
+		article.Subject = a.Header["Subject"][0]
+	} else {
+		article.Errors = append(article.Errors, fmt.Errorf("missing Subject"))
+	}
+
+	if xref, ok := a.Header["Xref"]; ok && len(xref) > 0 {
+		var err error
+		if article.Xref, err = ParseXref(xref[0]); err != nil {
+			article.Errors = append(article.Errors, err)
+		}
+	} else {
+		article.Errors = append(article.Errors, fmt.Errorf("missing Xref"))
+	}
+
+	if postingDate, ok := a.Header["Date"]; ok && len(postingDate) > 0 {
+		if t, err := ParsePostingDate(postingDate[0]); err != nil {
+			article.Errors = append(article.Errors, err)
+		} else {
+			article.Timestamp = t.Unix()
+		}
+	} else {
+		article.Errors = append(article.Errors, fmt.Errorf("missing Date"))
+	}
+
+	article.stripHeaders()
+	return article
+}
+
+var stripHeaders = []string{
+	"Message-Id",
+	"Subject",
+	"Xref",
+	"Date",
+	"Organization",
+	"Path",
+}
+
+func (a *Article) stripHeaders() {
+	for _, header := range stripHeaders {
+		delete(a.Header, header)
+	}
+}
+
+func (c *Client) Group(name string) chan *Group {
+	resp := make(chan *Group)
+	go func() { c.groupReq <- &groupReq{Name: name, Resp: resp} }()
+	return resp
 }
 
 func (c *Client) Articles(group string, start, end int) chan *Article {
+	resp := make(chan *Article)
 	go func() {
-		c.headsReq <- &headsReq{Group: group, Start: start, End: end}
+		c.headsReq <- &headsReq{Group: group, Start: start, End: end, Resp: resp}
 	}()
-	resp := <-c.headsResp
-	return resp.Heads
+	return resp
 }
 
 func (c *Client) nntpClient() {
@@ -132,41 +252,50 @@ func (c *Client) nntpClient() {
 
 		select {
 		case req := <-c.groupReq:
+			resp := &Group{}
 			var group *nntp.Group
 			group, err = conn.Group(req.Name)
-			c.groupResp <- &groupResp{Group: group, Error: err}
+			if err != nil {
+				resp.Errors = append(resp.Errors, err)
+			} else {
+				resp.Group = group
+			}
+			req.Resp <- resp
+			close(req.Resp)
 
 		case req := <-c.headsReq:
-			headsResp := &headsResp{Heads: make(chan *Article)}
 			_, err = conn.Group(req.Group)
-			if err != nil {
-				headsResp.Error = err
-			}
-
-			c.headsResp <- headsResp
-
 			for i := req.Start; i <= req.End; i++ {
 				article, headErr := conn.Head(fmt.Sprintf("%d", i))
 				if errors.Check(headErr, nntp.IsProtocol) {
 					err = headErr
-					headsResp.Heads <- &Article{
-						Number: i,
-						Error:  errors.Trace(headErr),
+					req.Resp <- &Article{
+						Xref: []Xref{
+							Xref{
+								Group:  req.Group,
+								Number: i,
+							},
+						},
+						Errors: []error{errors.Trace(headErr)},
 					}
-					headsResp.Error = errors.Trace(headErr)
 				} else if nntp.ErrorCode(headErr) == 423 {
 					logger.Tracef("%v: %d", headErr, i)
 					continue
 				} else if headErr != nil {
-					headsResp.Heads <- &Article{
-						Number: i,
-						Error:  errors.Trace(headErr),
+					req.Resp <- &Article{
+						Xref: []Xref{
+							Xref{
+								Group:  req.Group,
+								Number: i,
+							},
+						},
+						Errors: []error{errors.Trace(headErr)},
 					}
 				} else {
-					headsResp.Heads <- &Article{Article: article, Number: i}
+					req.Resp <- NewArticle(article)
 				}
 			}
-			close(headsResp.Heads)
+			close(req.Resp)
 		}
 
 		if err != nil {
